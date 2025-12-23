@@ -6,6 +6,7 @@ const Ledger = require('../models/Ledger');
 // @access  Public (all users can search any LR)
 const globalLRSearch = async (req, res) => {
   try {
+    console.log('Global LR Search called:', req.params, req.query);
     const { lrNumber } = req.params;
     const { companyName } = req.query; // Optional company name filter
 
@@ -14,6 +15,7 @@ const globalLRSearch = async (req, res) => {
     }
 
     const searchTerm = lrNumber.trim();
+    console.log('Searching for LR:', searchTerm);
 
     // Build query for trips - search by LR number and optionally by company name
     let tripQuery = {
@@ -29,11 +31,17 @@ const globalLRSearch = async (req, res) => {
     }
 
     // Search trips globally (no role-based filtering)
-    const trips = await Trip.find(tripQuery)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id')
-      .sort({ createdAt: -1 })
-      .limit(50);
+    let trips = [];
+    try {
+      trips = await Trip.find(tripQuery)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id')
+        .sort({ createdAt: -1 })
+        .limit(50);
+    } catch (tripError) {
+      console.error('Error fetching trips:', tripError);
+      trips = [];
+    }
 
     // Build query for ledger entries
     let ledgerQuery = {
@@ -44,29 +52,41 @@ const globalLRSearch = async (req, res) => {
     };
 
     // Search ledger entries globally (no role-based filtering)
-    const ledgerEntries = await Ledger.find(ledgerQuery)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id')
-      .populate('tripId', 'lrNumber route _id')
-      .sort({ createdAt: -1 })
-      .limit(50);
+    let ledgerEntries = [];
+    try {
+      ledgerEntries = await Ledger.find(ledgerQuery)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id')
+        .populate('tripId', 'lrNumber route _id')
+        .sort({ createdAt: -1 })
+        .limit(50);
+    } catch (ledgerError) {
+      console.error('Error fetching ledger entries:', ledgerError);
+      ledgerEntries = [];
+    }
 
-    // Transform trips
-    const transformedTrips = trips.map(trip => ({
-      ...trip.toObject(),
-      id: trip._id,
-      agentId: trip.agent?._id || trip.agentId?._id || trip.agentId,
-      agent: trip.agent?.name || trip.agentId?.name || trip.agent,
-      agentDetails: trip.agent || trip.agentId,
-    }));
+    // Transform trips - handle both populated and non-populated cases
+    const transformedTrips = trips.map(trip => {
+      const tripObj = trip.toObject ? trip.toObject() : trip;
+      return {
+        ...tripObj,
+        id: tripObj._id?.toString() || tripObj.id?.toString(),
+        agentId: tripObj.agent?._id?.toString() || tripObj.agentId?._id?.toString() || tripObj.agentId?.toString() || tripObj.agent?.toString(),
+        agent: tripObj.agent?.name || tripObj.agentId?.name || tripObj.agent || 'Unknown',
+        agentDetails: tripObj.agent || tripObj.agentId || null,
+      };
+    });
 
-    // Transform ledger entries
-    const transformedLedger = ledgerEntries.map(entry => ({
-      ...entry.toObject(),
-      id: entry._id,
-      agentId: entry.agent?._id || entry.agentId?._id || entry.agentId,
-      agent: entry.agent?.name || entry.agentId?.name || entry.agent,
-    }));
+    // Transform ledger entries - handle both populated and non-populated cases
+    const transformedLedger = ledgerEntries.map(entry => {
+      const entryObj = entry.toObject ? entry.toObject() : entry;
+      return {
+        ...entryObj,
+        id: entryObj._id?.toString() || entryObj.id?.toString(),
+        agentId: entryObj.agent?._id?.toString() || entryObj.agentId?._id?.toString() || entryObj.agentId?.toString() || entryObj.agent?.toString(),
+        agent: entryObj.agent?.name || entryObj.agentId?.name || entryObj.agent || 'Unknown',
+      };
+    });
 
     res.json({
       trips: transformedTrips,
@@ -75,7 +95,11 @@ const globalLRSearch = async (req, res) => {
     });
   } catch (error) {
     console.error('Global LR search error:', error);
-    res.status(500).json({ message: 'Server error during search' });
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      message: 'Server error during search',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 };
 
