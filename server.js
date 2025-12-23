@@ -29,6 +29,7 @@ app.use('/api/ledger', require('./routes/ledgerRoutes'));
 app.use('/api/disputes', require('./routes/disputeRoutes'));
 app.use('/api/reports', require('./routes/reportRoutes'));
 app.use('/api/audit-logs', require('./routes/auditLogRoutes'));
+app.use('/api/search', require('./routes/searchRoutes'));
 
 // Health check
 app.get('/api/health', (req, res) => {
