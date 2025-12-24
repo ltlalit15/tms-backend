@@ -177,15 +177,16 @@ const createTrip = async (req, res) => {
       branch: branchId || agent.branch || null,
     });
 
-    // Create ledger entry
-    if (!isBulk) {
+    // Create ledger entry - Only debit the advance amount paid by agent, NOT the freight
+    // Freight is informational, not a wallet transaction
+    if (!isBulk && advance > 0) {
       await Ledger.create({
         tripId: trip._id,
         lrNumber: trip.lrNumber,
         date: trip.date,
-        description: `Trip created - ${routeFrom} to ${routeTo}`,
+        description: `Trip created - ${routeFrom} to ${routeTo} (Advance paid: Rs ${advance})`,
         type: 'Trip Created',
-        amount: freight,
+        amount: advance, // Only debit the advance amount, not freight
         advance: advance,
         balance: balance,
         agent: agentId,
@@ -324,18 +325,20 @@ const addPayment = async (req, res) => {
       return res.status(400).json({ message: 'Mid-trip payments can only be added for Active trips' });
     }
 
-    const { amount, reason, mode, bank, agentId } = req.body;
+    const { amount, reason, mode, bank, agentId, userRole, userId } = req.body;
 
     // Use agentId from body, or trip's agent
     const targetAgentId = agentId || trip.agent;
+    const paymentAmount = parseFloat(amount);
+    const isFinancePayment = userRole === 'Finance';
 
     const payment = {
-      amount: parseFloat(amount),
+      amount: paymentAmount,
       reason,
       mode: mode || 'Cash',
       bank: bank || (mode === 'Cash' ? 'Cash' : ''),
-      addedBy: targetAgentId, // Use agentId
-      addedByRole: 'Agent', // Default role
+      addedBy: userId || targetAgentId, // Use userId if Finance, otherwise agentId
+      addedByRole: userRole || 'Agent', // Store who made the payment
     };
 
     trip.onTripPayments.push(payment);
@@ -352,21 +355,66 @@ const addPayment = async (req, res) => {
 
     await trip.save();
 
-    // Create ledger entry
-    await Ledger.create({
-      tripId: trip._id,
-      lrNumber: trip.lrNumber,
-      date: new Date(),
-      description: `On-trip payment: ${reason}`,
-      type: 'On-Trip Payment',
-      amount: parseFloat(amount),
-      advance: 0,
-      balance: trip.balance,
-      agent: targetAgentId,
-      agentId: targetAgentId,
-      bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
-      direction: 'Debit',
-    });
+    // If Finance makes payment on behalf of agent, create TWO ledger entries
+    if (isFinancePayment) {
+      // Entry 1: Finance → Agent (Credit) - Top-up
+      // Calculate agent's current balance before adding credit
+      const agentLedger = await Ledger.find({ agent: targetAgentId });
+      const agentBalance = agentLedger.reduce((sum, entry) => {
+        if (entry.direction === 'Credit') {
+          return sum + (entry.amount || 0);
+        } else {
+          return sum - (entry.amount || 0);
+        }
+      }, 0);
+
+      await Ledger.create({
+        tripId: trip._id,
+        lrNumber: trip.lrNumber,
+        date: new Date(),
+        description: `Top-up: Top up`,
+        type: 'Top-up',
+        amount: paymentAmount,
+        advance: 0,
+        balance: agentBalance + paymentAmount,
+        agent: targetAgentId,
+        agentId: targetAgentId,
+        bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+        direction: 'Credit',
+      });
+
+      // Entry 2: Agent → Trip Expense (Debit) - On-Trip Payment
+      await Ledger.create({
+        tripId: trip._id,
+        lrNumber: trip.lrNumber,
+        date: new Date(),
+        description: `On-trip payment: ${reason}`,
+        type: 'On-Trip Payment',
+        amount: paymentAmount,
+        advance: 0,
+        balance: trip.balance,
+        agent: targetAgentId,
+        agentId: targetAgentId,
+        bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+        direction: 'Debit',
+      });
+    } else {
+      // Agent makes payment - only create debit entry (existing behavior)
+      await Ledger.create({
+        tripId: trip._id,
+        lrNumber: trip.lrNumber,
+        date: new Date(),
+        description: `On-trip payment: ${reason}`,
+        type: 'On-Trip Payment',
+        amount: paymentAmount,
+        advance: 0,
+        balance: trip.balance,
+        agent: targetAgentId,
+        agentId: targetAgentId,
+        bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+        direction: 'Debit',
+      });
+    }
 
     const populatedTrip = await Trip.findById(trip._id)
       .populate('agent', 'name email phone branch _id')
@@ -375,16 +423,17 @@ const addPayment = async (req, res) => {
 
     // Create audit log
     await createAuditLog(
-      targetAgentId,
-      'Agent',
+      userId || targetAgentId,
+      userRole || 'Agent',
       'Add Payment',
       'Trip',
       trip._id,
       {
-        amount: parseFloat(amount),
+        amount: paymentAmount,
         reason,
         mode,
         lrNumber: trip.lrNumber,
+        isFinancePayment,
       },
       req.ip
     );
