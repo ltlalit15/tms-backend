@@ -191,7 +191,7 @@ const createTrip = async (req, res) => {
         agent: agentId,
         agentId: agentId,
         bank: 'HDFC Bank',
-        direction: 'Credit',
+        direction: 'Debit',
       });
     }
 
