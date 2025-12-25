@@ -32,18 +32,71 @@ const getDashboardStats = async (req, res) => {
     });
     const totalTrips = await Trip.countDocuments(tripQuery);
 
-    // Ledger stats
+    // Ledger stats - Get today's entries (check both createdAt and date fields)
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    // Query today's ledger entries - use createdAt as primary, date as fallback
     const todayLedger = await Ledger.find({
       ...ledgerQuery,
-      createdAt: { $gte: today },
-    });
+      $or: [
+        { createdAt: { $gte: today, $lt: tomorrow } },
+        { date: { $gte: today, $lt: tomorrow } }
+      ]
+    }).lean(); // Use lean() for better performance
+    
+    console.log('Today ledger entries count:', todayLedger.length)
+    console.log('Today date range:', today, 'to', tomorrow)
+    
+    // Also get Finance payments directly for debugging
+    const allFinancePayments = await Ledger.find({
+      ...ledgerQuery,
+      type: 'On-Trip Payment',
+      paymentMadeBy: 'Finance'
+    }).lean();
+    console.log('All Finance payments (any date):', allFinancePayments.length, allFinancePayments.map(p => ({ amount: p.amount, date: p.date, createdAt: p.createdAt, lrNumber: p.lrNumber })))
 
+    // Calculate daily top-ups from today's ledger entries
     const dailyTopUps = todayLedger
-      .filter(l => l.type === 'Top-up')
-      .reduce((sum, l) => sum + l.amount, 0);
+      .filter(l => l.type === 'Top-up' || l.type === 'Virtual Top-up')
+      .reduce((sum, l) => sum + (l.amount || 0), 0);
+    
+    console.log('Daily top-ups today:', dailyTopUps, 'from', todayLedger.filter(l => l.type === 'Top-up' || l.type === 'Virtual Top-up').length, 'entries')
 
+    // Finance mid-payments: On-Trip Payments made by Finance today
+    // SIMPLIFIED APPROACH: Query all Finance payments and filter by date in code
+    const allFinancePaymentsQuery = await Ledger.find({
+      type: 'On-Trip Payment',
+      paymentMadeBy: 'Finance'
+    }).lean();
+    
+    console.log('=== FINANCE PAYMENTS DEBUG ===')
+    console.log('All Finance payments found:', allFinancePaymentsQuery.length)
+    console.log('Today date range:', today.toISOString(), 'to', tomorrow.toISOString())
+    
+    allFinancePaymentsQuery.forEach(p => {
+      const pDate = p.date ? new Date(p.date) : new Date(p.createdAt)
+      const isToday = pDate >= today && pDate < tomorrow
+      console.log(`Finance payment: Amount=${p.amount}, LR=${p.lrNumber}, Date=${pDate.toISOString()}, IsToday=${isToday}, paymentMadeBy=${p.paymentMadeBy}`)
+    })
+    
+    // Filter by today's date
+    const financePaymentsToday = allFinancePaymentsQuery.filter(p => {
+      const pDate = p.date ? new Date(p.date) : new Date(p.createdAt)
+      return pDate >= today && pDate < tomorrow
+    })
+    
+    console.log('Finance payments today (filtered):', financePaymentsToday.length, financePaymentsToday.map(p => ({ amount: p.amount, lrNumber: p.lrNumber })))
+    
+    // Calculate total
+    const financeMidPayments = financePaymentsToday.reduce((sum, l) => sum + (l.amount || 0), 0);
+    
+    console.log('Finance mid-payments today (final):', financeMidPayments)
+    console.log('=== END FINANCE PAYMENTS DEBUG ===')
+
+    // All daily payments (for backward compatibility)
     const dailyPayments = todayLedger
       .filter(l => l.type === 'On-Trip Payment')
       .reduce((sum, l) => sum + l.amount, 0);
@@ -60,7 +113,38 @@ const getDashboardStats = async (req, res) => {
     const openDisputes = await Dispute.countDocuments({ ...disputeQuery, status: 'Open' });
     const resolvedDisputes = await Dispute.countDocuments({ ...disputeQuery, status: 'Resolved' });
 
-    res.json({
+    // Additional trip stats
+    const lrSheetsNotReceived = await Trip.countDocuments({ 
+      ...tripQuery, 
+      $or: [
+        { lrSheet: { $exists: false } },
+        { lrSheet: null },
+        { lrSheet: 'Not Received' },
+        { lrSheet: '' }
+      ]
+    });
+    const normalTrips = await Trip.countDocuments({ ...tripQuery, isBulk: false });
+    const bulkTrips = await Trip.countDocuments({ ...tripQuery, isBulk: true });
+
+    // Bank-wise movements today
+    const bankSummary = {};
+    todayLedger.forEach(entry => {
+      const bank = entry.bank || 'Cash';
+      if (!bankSummary[bank]) {
+        bankSummary[bank] = { credit: 0, debit: 0, net: 0 };
+      }
+      if (entry.direction === 'Credit') {
+        bankSummary[bank].credit += (entry.amount || 0);
+        bankSummary[bank].net += (entry.amount || 0);
+      } else {
+        bankSummary[bank].debit += (entry.amount || 0);
+        bankSummary[bank].net -= (entry.amount || 0);
+      }
+    });
+    const bankMovementsToday = Object.keys(bankSummary).length;
+    const totalBankNet = Object.values(bankSummary).reduce((sum, b) => sum + b.net, 0);
+
+    const response = {
       trips: {
         active: activeTrips,
         completed: completedTrips,
@@ -76,7 +160,34 @@ const getDashboardStats = async (req, res) => {
         open: openDisputes,
         resolved: resolvedDisputes,
       },
-    });
+      // Finance dashboard specific stats
+      midPaymentsToday: financeMidPayments,
+      topUpsToday: dailyTopUps,
+      activeTrips: activeTrips,
+      lrSheetsNotReceived: lrSheetsNotReceived,
+      normalTrips: normalTrips,
+      bulkTrips: bulkTrips,
+      bankMovementsToday: bankMovementsToday,
+      totalBankNet: totalBankNet,
+      bankSummary: bankSummary,
+      trips: {
+        total: totalTrips,
+        active: activeTrips,
+        completed: completedTrips,
+        disputed: disputedTrips,
+      },
+    };
+    
+    console.log('=== DASHBOARD STATS RESPONSE ===')
+    console.log('midPaymentsToday:', financeMidPayments)
+    console.log('topUpsToday:', dailyTopUps)
+    console.log('activeTrips:', activeTrips)
+    console.log('normalTrips:', normalTrips)
+    console.log('bulkTrips:', bulkTrips)
+    console.log('Full response:', JSON.stringify(response, null, 2))
+    console.log('=== END DASHBOARD STATS ===')
+    
+    res.json(response);
   } catch (error) {
     console.error('Get dashboard stats error:', error);
     res.status(500).json({ message: 'Server error' });

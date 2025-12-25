@@ -381,6 +381,7 @@ const addPayment = async (req, res) => {
         agentId: targetAgentId,
         bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
         direction: 'Credit',
+        paymentMadeBy: 'Finance', // Mark as Finance payment
       });
 
       // Entry 2: Agent → Trip Expense (Debit) - On-Trip Payment
@@ -397,6 +398,7 @@ const addPayment = async (req, res) => {
         agentId: targetAgentId,
         bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
         direction: 'Debit',
+        paymentMadeBy: 'Finance', // Mark as Finance payment
       });
     } else {
       // Agent makes payment - only create debit entry (existing behavior)
@@ -413,6 +415,7 @@ const addPayment = async (req, res) => {
         agentId: targetAgentId,
         bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
         direction: 'Debit',
+        paymentMadeBy: 'Agent', // Mark as Agent payment
       });
     }
 
@@ -548,9 +551,24 @@ const closeTrip = async (req, res) => {
       return sum + (parseFloat(val) || 0);
     }, 0);
 
+    // Separate Finance payments from Agent payments
+    // Finance payments are already credited to agent wallet, so don't deduct from finalBalance
+    const agentPayments = trip.onTripPayments
+      .filter(p => p.addedByRole !== 'Finance')
+      .reduce((sum, p) => sum + (p.amount || 0), 0);
+    
+    const financePayments = trip.onTripPayments
+      .filter(p => p.addedByRole === 'Finance')
+      .reduce((sum, p) => sum + (p.amount || 0), 0);
+    
     const totalPayments = trip.onTripPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
     const initialBalance = trip.freight - trip.advance;
-    const finalBalance = initialBalance - totalDeductions - totalPayments;
+    
+    // Final balance calculation:
+    // initialBalance - deductions - agentPayments
+    // Finance payments are NOT deducted because they're already credited to agent wallet
+    // Finance payments should INCREASE the final settlement amount
+    const finalBalance = initialBalance - totalDeductions - agentPayments + financePayments;
 
     trip.status = 'Completed';
     trip.finalBalance = finalBalance;

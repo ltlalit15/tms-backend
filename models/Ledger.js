@@ -66,6 +66,11 @@ const ledgerSchema = new mongoose.Schema({
     required: true,
     enum: ['Credit', 'Debit'],
   },
+  paymentMadeBy: {
+    type: String,
+    enum: ['Finance', 'Agent'],
+    default: null, // null means not applicable or old entries
+  },
 }, {
   timestamps: true,
 });
