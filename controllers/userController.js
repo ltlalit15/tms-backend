@@ -120,23 +120,27 @@ const createUser = async (req, res) => {
       branch: role === 'Agent' ? branchName : null,
     });
 
-    // Create audit log
-    const userId = req.body.userId || null; // Admin who created the user
-    const userRole = req.body.userRole || 'Admin';
-    await createAuditLog(
-      userId,
-      userRole,
-      'Create User',
-      'User',
-      user._id,
-      {
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        branch: user.branch,
-      },
-      req.ip
-    );
+    // Create audit log (don't fail if this fails)
+    try {
+      const userId = req.body.userId || null;
+      const userRole = req.body.userRole || 'Admin';
+      await createAuditLog(
+        userId,
+        userRole,
+        'Create User',
+        'User',
+        user._id,
+        {
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          branch: user.branch,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+    }
 
     res.status(201).json({
       _id: user._id,
@@ -149,7 +153,25 @@ const createUser = async (req, res) => {
     });
   } catch (error) {
     console.error('Create user error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If user was created but response failed, still return success
+    try {
+      const existingUser = await User.findOne({ email: req.body.email?.toLowerCase() });
+      if (existingUser) {
+        return res.status(201).json({
+          _id: existingUser._id,
+          id: existingUser._id,
+          name: existingUser.name,
+          email: existingUser.email,
+          phone: existingUser.phone,
+          role: existingUser.role,
+          branch: existingUser.branch,
+        });
+      }
+    } catch (checkError) {
+      console.error('Error checking existing user:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 

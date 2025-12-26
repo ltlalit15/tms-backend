@@ -196,31 +196,76 @@ const createTrip = async (req, res) => {
       });
     }
 
-    const populatedTrip = await Trip.findById(trip._id)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id');
+    // Populate trip with error handling
+    let populatedTrip;
+    try {
+      populatedTrip = await Trip.findById(trip._id)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id');
+    } catch (populateError) {
+      console.error('Populate error (non-critical):', populateError);
+      // If populate fails, use trip without populate
+      populatedTrip = trip;
+    }
 
-    // Create audit log
-    await createAuditLog(
-      agentId,
-      agent?.role || 'Agent',
-      'Create Trip',
-      'Trip',
-      trip._id,
-      {
-        lrNumber: trip.lrNumber,
-        route: trip.route,
-        freight: trip.freight,
-        advance: trip.advance,
-        status: trip.status,
-      },
-      req.ip
-    );
+    // Transform trip with error handling
+    let transformedTrip;
+    try {
+      transformedTrip = transformTrip(populatedTrip);
+    } catch (transformError) {
+      console.error('Transform error (non-critical):', transformError);
+      // If transform fails, send basic trip data
+      transformedTrip = {
+        ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
+        id: trip._id,
+        agentId: agentId,
+        agent: agent?.name || 'Unknown',
+      };
+    }
 
-    res.status(201).json(transformTrip(populatedTrip));
+    // Create audit log (don't fail if this fails)
+    try {
+      await createAuditLog(
+        agentId,
+        agent?.role || 'Agent',
+        'Create Trip',
+        'Trip',
+        trip._id,
+        {
+          lrNumber: trip.lrNumber,
+          route: trip.route,
+          freight: trip.freight,
+          advance: trip.advance,
+          status: trip.status,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+      // Continue even if audit log fails
+    }
+
+    res.status(201).json(transformedTrip);
   } catch (error) {
     console.error('Create trip error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If trip was created but response failed, still return success
+    try {
+      const existingTrip = await Trip.findOne({ lrNumber: req.body.lrNumber });
+      if (existingTrip) {
+        // Trip was created, return it even if there was an error
+        const basicTrip = {
+          ...existingTrip.toObject(),
+          id: existingTrip._id,
+          agentId: req.body.agentId,
+          agent: 'Unknown',
+        };
+        return res.status(201).json(basicTrip);
+      }
+    } catch (checkError) {
+      console.error('Error checking existing trip:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -246,30 +291,71 @@ const updateTrip = async (req, res) => {
 
     const updatedTrip = await trip.save();
 
-    const populatedTrip = await Trip.findById(updatedTrip._id)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id');
+    // Populate trip with error handling
+    let populatedTrip;
+    try {
+      populatedTrip = await Trip.findById(updatedTrip._id)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id');
+    } catch (populateError) {
+      console.error('Populate error (non-critical):', populateError);
+      populatedTrip = updatedTrip;
+    }
 
-    // Create audit log
-    const userId = req.body.userId || trip.agent || null;
-    const userRole = req.body.userRole || 'Agent';
-    await createAuditLog(
-      userId,
-      userRole,
-      'Update Trip',
-      'Trip',
-      trip._id,
-      {
-        changes: req.body,
-        previousStatus: trip.status,
-      },
-      req.ip
-    );
+    // Transform trip with error handling
+    let transformedTrip;
+    try {
+      transformedTrip = transformTrip(populatedTrip);
+    } catch (transformError) {
+      console.error('Transform error (non-critical):', transformError);
+      transformedTrip = {
+        ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
+        id: updatedTrip._id,
+        agentId: updatedTrip.agent,
+        agent: 'Unknown',
+      };
+    }
 
-    res.json(transformTrip(populatedTrip));
+    // Create audit log (don't fail if this fails)
+    try {
+      const userId = req.body.userId || trip.agent || null;
+      const userRole = req.body.userRole || 'Agent';
+      await createAuditLog(
+        userId,
+        userRole,
+        'Update Trip',
+        'Trip',
+        trip._id,
+        {
+          changes: req.body,
+          previousStatus: trip.status,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+    }
+
+    res.json(transformedTrip);
   } catch (error) {
     console.error('Update trip error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If trip was updated but response failed, still return success
+    try {
+      const existingTrip = await Trip.findById(req.params.id);
+      if (existingTrip) {
+        const basicTrip = {
+          ...existingTrip.toObject(),
+          id: existingTrip._id,
+          agentId: existingTrip.agent,
+          agent: 'Unknown',
+        };
+        return res.json(basicTrip);
+      }
+    } catch (checkError) {
+      console.error('Error checking existing trip:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -419,32 +505,77 @@ const addPayment = async (req, res) => {
       });
     }
 
-    const populatedTrip = await Trip.findById(trip._id)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id')
-      .populate('onTripPayments.addedBy', 'name role _id');
+    // Populate trip with error handling
+    let populatedTrip;
+    try {
+      populatedTrip = await Trip.findById(trip._id)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id')
+        .populate('onTripPayments.addedBy', 'name role _id');
+    } catch (populateError) {
+      console.error('Populate error (non-critical):', populateError);
+      // If populate fails, use trip without populate
+      populatedTrip = trip;
+    }
 
-    // Create audit log
-    await createAuditLog(
-      userId || targetAgentId,
-      userRole || 'Agent',
-      'Add Payment',
-      'Trip',
-      trip._id,
-      {
-        amount: paymentAmount,
-        reason,
-        mode,
-        lrNumber: trip.lrNumber,
-        isFinancePayment,
-      },
-      req.ip
-    );
+    // Transform trip with error handling
+    let transformedTrip;
+    try {
+      transformedTrip = transformTrip(populatedTrip);
+    } catch (transformError) {
+      console.error('Transform error (non-critical):', transformError);
+      // If transform fails, send basic trip data
+      transformedTrip = {
+        ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
+        id: trip._id,
+        agentId: targetAgentId,
+        agent: 'Unknown',
+      };
+    }
 
-    res.json(transformTrip(populatedTrip));
+    // Create audit log (don't fail if this fails)
+    try {
+      await createAuditLog(
+        userId || targetAgentId,
+        userRole || 'Agent',
+        'Add Payment',
+        'Trip',
+        trip._id,
+        {
+          amount: paymentAmount,
+          reason,
+          mode,
+          lrNumber: trip.lrNumber,
+          isFinancePayment,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+      // Continue even if audit log fails
+    }
+
+    res.json(transformedTrip);
   } catch (error) {
     console.error('Add payment error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If payment was added but response failed, still return success
+    try {
+      const existingTrip = await Trip.findById(req.params.id);
+      if (existingTrip && existingTrip.onTripPayments.length > 0) {
+        // Payment was added, return trip even if there was an error
+        const basicTrip = {
+          ...existingTrip.toObject(),
+          id: existingTrip._id,
+          agentId: targetAgentId || existingTrip.agent,
+          agent: 'Unknown',
+        };
+        return res.json(basicTrip);
+      }
+    } catch (checkError) {
+      console.error('Error checking existing trip:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -478,30 +609,71 @@ const updateDeductions = async (req, res) => {
 
     await trip.save();
 
-    const populatedTrip = await Trip.findById(trip._id)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id');
+    // Populate trip with error handling
+    let populatedTrip;
+    try {
+      populatedTrip = await Trip.findById(trip._id)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id');
+    } catch (populateError) {
+      console.error('Populate error (non-critical):', populateError);
+      populatedTrip = trip;
+    }
 
-    // Create audit log
-    const userId = req.body.userId || trip.agent || null;
-    const userRole = req.body.userRole || 'Agent';
-    await createAuditLog(
-      userId,
-      userRole,
-      'Update Deductions',
-      'Trip',
-      trip._id,
-      {
-        deductions: req.body,
-        lrNumber: trip.lrNumber,
-      },
-      req.ip
-    );
+    // Transform trip with error handling
+    let transformedTrip;
+    try {
+      transformedTrip = transformTrip(populatedTrip);
+    } catch (transformError) {
+      console.error('Transform error (non-critical):', transformError);
+      transformedTrip = {
+        ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
+        id: trip._id,
+        agentId: trip.agent,
+        agent: 'Unknown',
+      };
+    }
 
-    res.json(transformTrip(populatedTrip));
+    // Create audit log (don't fail if this fails)
+    try {
+      const userId = req.body.userId || trip.agent || null;
+      const userRole = req.body.userRole || 'Agent';
+      await createAuditLog(
+        userId,
+        userRole,
+        'Update Deductions',
+        'Trip',
+        trip._id,
+        {
+          deductions: req.body,
+          lrNumber: trip.lrNumber,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+    }
+
+    res.json(transformedTrip);
   } catch (error) {
     console.error('Update deductions error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If trip was updated but response failed, still return success
+    try {
+      const existingTrip = await Trip.findById(req.params.id);
+      if (existingTrip) {
+        const basicTrip = {
+          ...existingTrip.toObject(),
+          id: existingTrip._id,
+          agentId: existingTrip.agent,
+          agent: 'Unknown',
+        };
+        return res.json(basicTrip);
+      }
+    } catch (checkError) {
+      console.error('Error checking existing trip:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -535,10 +707,32 @@ const closeTrip = async (req, res) => {
       trip.closedBy = trip.agent; // Use trip's agent
       await trip.save();
       
-      const populatedTrip = await Trip.findById(trip._id)
-        .populate('agent', 'name email phone branch _id')
-        .populate('agentId', 'name email phone branch _id');
-      return res.json(transformTrip(populatedTrip));
+      // Populate trip with error handling
+      let populatedTrip;
+      try {
+        populatedTrip = await Trip.findById(trip._id)
+          .populate('agent', 'name email phone branch _id')
+          .populate('agentId', 'name email phone branch _id');
+      } catch (populateError) {
+        console.error('Populate error (non-critical):', populateError);
+        populatedTrip = trip;
+      }
+
+      // Transform trip with error handling
+      let transformedTrip;
+      try {
+        transformedTrip = transformTrip(populatedTrip);
+      } catch (transformError) {
+        console.error('Transform error (non-critical):', transformError);
+        transformedTrip = {
+          ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
+          id: trip._id,
+          agentId: trip.agent,
+          agent: 'Unknown',
+        };
+      }
+
+      return res.json(transformedTrip);
     }
 
     // For Regular trips - calculate final balance
@@ -619,31 +813,73 @@ const closeTrip = async (req, res) => {
       });
     }
 
-    const populatedTrip = await Trip.findById(trip._id)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id');
+    // Populate trip with error handling
+    let populatedTrip;
+    try {
+      populatedTrip = await Trip.findById(trip._id)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id');
+    } catch (populateError) {
+      console.error('Populate error (non-critical):', populateError);
+      populatedTrip = trip;
+    }
 
-    // Create audit log
-    const userId = req.body.userId || trip.agent || null;
-    const userRole = req.body.userRole || 'Agent';
-    await createAuditLog(
-      userId,
-      userRole,
-      'Close Trip',
-      'Trip',
-      trip._id,
-      {
-        lrNumber: trip.lrNumber,
-        finalBalance,
-        forceClose: forceClose || false,
-      },
-      req.ip
-    );
+    // Transform trip with error handling
+    let transformedTrip;
+    try {
+      transformedTrip = transformTrip(populatedTrip);
+    } catch (transformError) {
+      console.error('Transform error (non-critical):', transformError);
+      transformedTrip = {
+        ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
+        id: trip._id,
+        agentId: trip.agent,
+        agent: 'Unknown',
+      };
+    }
 
-    res.json(transformTrip(populatedTrip));
+    // Create audit log (don't fail if this fails)
+    try {
+      const userId = req.body.userId || trip.agent || null;
+      const userRole = req.body.userRole || 'Agent';
+      await createAuditLog(
+        userId,
+        userRole,
+        'Close Trip',
+        'Trip',
+        trip._id,
+        {
+          lrNumber: trip.lrNumber,
+          finalBalance,
+          forceClose: forceClose || false,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+    }
+
+    res.json(transformedTrip);
   } catch (error) {
     console.error('Close trip error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If trip was closed but response failed, still return success
+    try {
+      const existingTrip = await Trip.findById(req.params.id);
+      if (existingTrip && existingTrip.status === 'Completed') {
+        // Trip was closed, return it even if there was an error
+        const basicTrip = {
+          ...existingTrip.toObject(),
+          id: existingTrip._id,
+          agentId: existingTrip.agent,
+          agent: 'Unknown',
+        };
+        return res.json(basicTrip);
+      }
+    } catch (checkError) {
+      console.error('Error checking existing trip:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 

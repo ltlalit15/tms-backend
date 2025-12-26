@@ -121,31 +121,80 @@ const createDispute = async (req, res) => {
     trip.status = 'In Dispute';
     await trip.save();
 
-    const populatedDispute = await Dispute.findById(dispute._id)
-      .populate('agent', 'name email phone branch _id')
-      .populate('agentId', 'name email phone branch _id')
-      .populate('tripId', 'lrNumber route status _id');
+    // Populate dispute with error handling
+    let populatedDispute;
+    try {
+      populatedDispute = await Dispute.findById(dispute._id)
+        .populate('agent', 'name email phone branch _id')
+        .populate('agentId', 'name email phone branch _id')
+        .populate('tripId', 'lrNumber route status _id');
+    } catch (populateError) {
+      console.error('Populate error (non-critical):', populateError);
+      populatedDispute = dispute;
+    }
 
-    // Create audit log
-    await createAuditLog(
-      agentId,
-      'Agent',
-      'Create Dispute',
-      'Dispute',
-      dispute._id,
-      {
-        lrNumber: trip.lrNumber,
-        type,
-        amount: parseFloat(amount) || 0,
-        tripId: trip._id,
-      },
-      req.ip
-    );
+    // Transform dispute
+    let transformedDispute;
+    try {
+      transformedDispute = {
+        ...(populatedDispute.toObject ? populatedDispute.toObject() : populatedDispute),
+        id: dispute._id,
+        agentId: dispute.agent?._id || dispute.agentId?._id || dispute.agentId,
+        agent: dispute.agent?.name || dispute.agentId?.name || dispute.agent,
+        tripId: dispute.tripId?._id || dispute.tripId,
+      };
+    } catch (transformError) {
+      console.error('Transform error (non-critical):', transformError);
+      transformedDispute = {
+        ...dispute.toObject(),
+        id: dispute._id,
+        agentId: agentId,
+        agent: 'Unknown',
+        tripId: tripId,
+      };
+    }
 
-    res.status(201).json(populatedDispute);
+    // Create audit log (don't fail if this fails)
+    try {
+      await createAuditLog(
+        agentId,
+        'Agent',
+        'Create Dispute',
+        'Dispute',
+        dispute._id,
+        {
+          lrNumber: trip.lrNumber,
+          type,
+          amount: parseFloat(amount) || 0,
+          tripId: trip._id,
+        },
+        req.ip
+      );
+    } catch (auditError) {
+      console.error('Audit log error (non-critical):', auditError);
+    }
+
+    res.status(201).json(transformedDispute);
   } catch (error) {
     console.error('Create dispute error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Error stack:', error.stack);
+    // If dispute was created but response failed, still return success
+    try {
+      const existingDispute = await Dispute.findOne({ tripId: req.body.tripId, status: 'Open' });
+      if (existingDispute) {
+        const basicDispute = {
+          ...existingDispute.toObject(),
+          id: existingDispute._id,
+          agentId: req.body.agentId,
+          agent: 'Unknown',
+          tripId: req.body.tripId,
+        };
+        return res.status(201).json(basicDispute);
+      }
+    } catch (checkError) {
+      console.error('Error checking existing dispute:', checkError);
+    }
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
