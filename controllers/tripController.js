@@ -428,10 +428,30 @@ const addPayment = async (req, res) => {
 
     const { amount, reason, mode, bank, agentId, userRole, userId } = req.body;
 
-    // Use agentId from body, or trip's agent
-    const targetAgentId = agentId || trip.agent;
+    // IMPORTANT: Payment should be deducted from the agent who is making the payment, NOT the trip creator
+    // Rule: 
+    // - If Finance is adding payment: Use agentId from body (selected agent)
+    // - If Agent is adding payment: Use userId (logged-in agent making the payment)
+    // - Fallback: trip.agent (only if agentId and userId both not available)
+    let targetAgentId;
+    if (userRole === 'Finance') {
+      // Finance payment: Use selected agent from dropdown
+      if (!agentId) {
+        return res.status(400).json({ message: 'Agent selection is required for Finance payments' });
+      }
+      targetAgentId = agentId;
+    } else {
+      // Agent payment: Use logged-in agent (who is making the payment)
+      if (!userId) {
+        return res.status(400).json({ message: 'User ID is required for Agent payments' });
+      }
+      targetAgentId = userId;
+    }
+    
     const paymentAmount = parseFloat(amount);
     const isFinancePayment = userRole === 'Finance';
+    
+    console.log(`Adding payment: LR ${trip.lrNumber}, Amount ${paymentAmount}, UserRole ${userRole}, Passed agentId ${agentId}, UserId ${userId}, Trip agent ${trip.agent}, Using targetAgentId ${targetAgentId} (payment will be deducted from this agent's account)`);
 
     const payment = {
       amount: paymentAmount,
@@ -458,66 +478,112 @@ const addPayment = async (req, res) => {
 
     // If Finance makes payment on behalf of agent, create TWO ledger entries
     if (isFinancePayment) {
-      // Entry 1: Finance → Agent (Credit) - Top-up
-      // Calculate agent's current balance before adding credit
-      const agentLedger = await Ledger.find({ agent: targetAgentId });
-      const agentBalance = agentLedger.reduce((sum, entry) => {
-        if (entry.direction === 'Credit') {
-          return sum + (entry.amount || 0);
-        } else {
-          return sum - (entry.amount || 0);
-        }
-      }, 0);
+      try {
+        // Entry 1: Finance → Agent (Credit) - Top-up
+        // Calculate agent's current balance before adding credit
+        const agentLedger = await Ledger.find({ agent: targetAgentId });
+        const agentBalance = agentLedger.reduce((sum, entry) => {
+          if (entry.direction === 'Credit') {
+            return sum + (entry.amount || 0);
+          } else {
+            return sum - (entry.amount || 0);
+          }
+        }, 0);
 
-      await Ledger.create({
-        tripId: trip._id,
-        lrNumber: trip.lrNumber,
-        date: new Date(),
-        description: `Top-up: Top up`,
-        type: 'Top-up',
-        amount: paymentAmount,
-        advance: 0,
-        balance: agentBalance + paymentAmount,
-        agent: targetAgentId,
-        agentId: targetAgentId,
-        bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
-        direction: 'Credit',
-        paymentMadeBy: 'Finance', // Mark as Finance payment
-      });
+        await Ledger.create({
+          tripId: trip._id,
+          lrNumber: trip.lrNumber,
+          date: new Date(),
+          description: `Top-up: Top up`,
+          type: 'Top-up',
+          amount: paymentAmount,
+          advance: 0,
+          balance: agentBalance + paymentAmount,
+          agent: targetAgentId,
+          agentId: targetAgentId,
+          bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+          direction: 'Credit',
+          paymentMadeBy: 'Finance', // Mark as Finance payment
+        });
+        console.log(`Ledger entry created for Finance Credit (Top-up): LR ${trip.lrNumber}, Amount ${paymentAmount}, Agent ${targetAgentId}`);
 
-      // Entry 2: Agent → Trip Expense (Debit) - On-Trip Payment
-      await Ledger.create({
-        tripId: trip._id,
-        lrNumber: trip.lrNumber,
-        date: new Date(),
-        description: `On-trip payment: ${reason}`,
-        type: 'On-Trip Payment',
-        amount: paymentAmount,
-        advance: 0,
-        balance: trip.balance,
-        agent: targetAgentId,
-        agentId: targetAgentId,
-        bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
-        direction: 'Debit',
-        paymentMadeBy: 'Finance', // Mark as Finance payment
-      });
+        // Entry 2: Agent → Trip Expense (Debit) - On-Trip Payment
+        await Ledger.create({
+          tripId: trip._id,
+          lrNumber: trip.lrNumber,
+          date: new Date(),
+          description: `On-trip payment: ${reason}`,
+          type: 'On-Trip Payment',
+          amount: paymentAmount,
+          advance: 0,
+          balance: trip.balance,
+          agent: targetAgentId,
+          agentId: targetAgentId,
+          bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+          direction: 'Debit',
+          paymentMadeBy: 'Finance', // Mark as Finance payment
+        });
+        console.log(`Ledger entry created for Finance Debit (On-Trip Payment): LR ${trip.lrNumber}, Amount ${paymentAmount}, Agent ${targetAgentId}`);
+      } catch (ledgerError) {
+        console.error(`Error creating ledger entries for Finance payment (non-critical): LR ${trip.lrNumber}, Agent ${targetAgentId}, Error:`, ledgerError);
+        // Continue even if ledger entry creation fails - trip payment is already saved
+      }
     } else {
-      // Agent makes payment - only create debit entry (existing behavior)
-      await Ledger.create({
-        tripId: trip._id,
-        lrNumber: trip.lrNumber,
-        date: new Date(),
-        description: `On-trip payment: ${reason}`,
-        type: 'On-Trip Payment',
-        amount: paymentAmount,
-        advance: 0,
-        balance: trip.balance,
-        agent: targetAgentId,
-        agentId: targetAgentId,
-        bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
-        direction: 'Debit',
-        paymentMadeBy: 'Agent', // Mark as Agent payment
-      });
+      // Agent makes payment - create debit entry for payment maker AND informational entry for trip creator
+      try {
+        // Entry 1: Payment maker's account - Debit (balance affected)
+        await Ledger.create({
+          tripId: trip._id,
+          lrNumber: trip.lrNumber,
+          date: new Date(),
+          description: `On-trip payment: ${reason}`,
+          type: 'On-Trip Payment',
+          amount: paymentAmount,
+          advance: 0,
+          balance: trip.balance,
+          agent: targetAgentId,
+          agentId: targetAgentId,
+          bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+          direction: 'Debit',
+          paymentMadeBy: 'Agent', // Mark as Agent payment
+        });
+        console.log(`Ledger entry created for Agent On-Trip Payment (Payment Maker): LR ${trip.lrNumber}, Amount ${paymentAmount}, Agent ${targetAgentId}`);
+        
+        // Entry 2: Trip creator's account - Informational entry (if different from payment maker)
+        const tripCreatorId = trip.agent || trip.agentId;
+        if (tripCreatorId && String(tripCreatorId) !== String(targetAgentId)) {
+          // Calculate trip creator's balance (don't affect it, just show reference)
+          const tripCreatorLedger = await Ledger.find({ agent: tripCreatorId });
+          const tripCreatorBalance = tripCreatorLedger.reduce((sum, entry) => {
+            if (entry.direction === 'Credit') {
+              return sum + (entry.amount || 0);
+            } else {
+              return sum - (entry.amount || 0);
+            }
+          }, 0);
+          
+          await Ledger.create({
+            tripId: trip._id,
+            lrNumber: trip.lrNumber,
+            date: new Date(),
+            description: `On-trip payment (by another agent): ${reason}`,
+            type: 'On-Trip Payment',
+            amount: paymentAmount,
+            advance: 0,
+            balance: tripCreatorBalance, // No change to balance, just informational
+            agent: tripCreatorId,
+            agentId: tripCreatorId,
+            bank: bank || (mode === 'Cash' ? 'Cash' : 'HDFC Bank'),
+            direction: 'Debit',
+            paymentMadeBy: 'Agent', // Mark as Agent payment
+            isInformational: true, // Flag to indicate this entry is informational only (balance not affected)
+          });
+          console.log(`Ledger entry created for Trip Creator (Informational): LR ${trip.lrNumber}, Amount ${paymentAmount}, Trip Creator ${tripCreatorId}`);
+        }
+      } catch (ledgerError) {
+        console.error(`Error creating ledger entries for Agent On-Trip Payment (non-critical): LR ${trip.lrNumber}, Agent ${targetAgentId}, Error:`, ledgerError);
+        // Continue even if ledger entry creation fails - trip payment is already saved
+      }
     }
 
     // Populate trip with error handling
