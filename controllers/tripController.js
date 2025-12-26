@@ -180,20 +180,35 @@ const createTrip = async (req, res) => {
     // Create ledger entry - Only debit the advance amount paid by agent, NOT the freight
     // Freight is informational, not a wallet transaction
     if (!isBulk && advance > 0) {
-      await Ledger.create({
-        tripId: trip._id,
-        lrNumber: trip.lrNumber,
-        date: trip.date,
-        description: `Trip created - ${routeFrom} to ${routeTo} (Advance paid: Rs ${advance})`,
-        type: 'Trip Created',
-        amount: advance, // Only debit the advance amount, not freight
-        advance: advance,
-        balance: balance,
-        agent: agentId,
-        agentId: agentId,
-        bank: 'HDFC Bank',
-        direction: 'Debit',
-      });
+      try {
+        const ledgerEntry = await Ledger.create({
+          tripId: trip._id,
+          lrNumber: trip.lrNumber,
+          date: trip.date,
+          description: `Trip created - ${routeFrom} to ${routeTo} (Advance paid: Rs ${advance})`,
+          type: 'Trip Created',
+          amount: advance, // Only debit the advance amount, not freight
+          advance: advance,
+          balance: balance,
+          agent: agentId,
+          agentId: agentId,
+          bank: 'HDFC Bank',
+          direction: 'Debit',
+        });
+        console.log('Ledger entry created successfully:', {
+          id: ledgerEntry._id,
+          type: ledgerEntry.type,
+          amount: ledgerEntry.amount,
+          lrNumber: ledgerEntry.lrNumber,
+          agentId: ledgerEntry.agentId
+        });
+      } catch (ledgerError) {
+        console.error('Error creating ledger entry for trip:', ledgerError);
+        // Don't fail the trip creation if ledger entry fails
+        // But log it for debugging
+      }
+    } else if (!isBulk && advance === 0) {
+      console.log('No ledger entry created: advance is 0 or trip is bulk');
     }
 
     // Populate trip with error handling

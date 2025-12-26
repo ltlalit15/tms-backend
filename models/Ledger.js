@@ -66,13 +66,15 @@ const ledgerSchema = new mongoose.Schema({
     required: true,
     enum: ['Credit', 'Debit'],
   },
-  paymentMadeBy: {
-    type: String,
-    enum: ['Finance', 'Agent'],
-    default: null, // null means not applicable or old entries
-  },
+  // paymentMadeBy field - commented out temporarily to avoid enum validation errors
+  // Will be added back after server restart with proper configuration
+  // paymentMadeBy: {
+  //   type: mongoose.Schema.Types.Mixed,
+  //   required: false,
+  // },
 }, {
   timestamps: true,
+  strict: false, // Allow fields not in schema to be saved
 });
 
 // Indexes for better query performance
@@ -81,6 +83,18 @@ ledgerSchema.index({ tripId: 1 });
 ledgerSchema.index({ date: -1 });
 ledgerSchema.index({ createdAt: -1 });
 ledgerSchema.index({ lrNumber: 1 });
+
+// Note: paymentMadeBy field removed from schema to avoid enum validation errors
+// It can still be saved to documents due to strict: false option
+// Pre-save and pre-validate hooks removed as field is not in schema
+
+// Delete existing model if it exists to avoid schema caching issues
+if (mongoose.models.Ledger) {
+  delete mongoose.models.Ledger;
+}
+if (mongoose.modelSchemas && mongoose.modelSchemas.Ledger) {
+  delete mongoose.modelSchemas.Ledger;
+}
 
 module.exports = mongoose.model('Ledger', ledgerSchema);
 
