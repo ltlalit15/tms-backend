@@ -21,6 +21,9 @@ const transformTrip = (trip) => {
     addedBy: payment.addedBy?.name || payment.addedBy || payment.addedByRole || 'Unknown',
   })) || tripObj.onTripPayments;
   
+  // Get driverPhoneNumber from trip object (Mongoose document) or tripObj (plain object)
+  const driverPhone = trip.driverPhoneNumber || tripObj.driverPhoneNumber || null;
+  
   return {
     ...tripObj,
     id: tripObj._id,
@@ -28,6 +31,8 @@ const transformTrip = (trip) => {
     agent: tripObj.agent?.name || tripObj.agentId?.name || tripObj.agent,
     attachments: transformedAttachments,
     onTripPayments: transformedPayments,
+    // Explicitly include driverPhoneNumber - ensure it's always included
+    driverPhoneNumber: driverPhone,
   };
 };
 
@@ -36,7 +41,7 @@ const transformTrip = (trip) => {
 // @access  Public
 const getTrips = async (req, res) => {
   try {
-    const { agentId, branch, status, lrNumber, page = 1, limit = 50 } = req.query;
+    const { agentId, branch, status, lrNumber, page = 1, limit = 50, startDate, endDate } = req.query;
     let query = {};
 
     // No role-based filtering - all trips visible to all
@@ -56,25 +61,44 @@ const getTrips = async (req, res) => {
         { tripId: { $regex: lrNumber, $options: 'i' } },
       ];
     }
+    // Date range filter
+    if (startDate || endDate) {
+      query.date = {};
+      if (startDate) {
+        query.date.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        // Include the entire end date by setting time to end of day
+        const endDateTime = new Date(endDate);
+        endDateTime.setHours(23, 59, 59, 999);
+        query.date.$lte = endDateTime;
+      }
+    }
 
     const trips = await Trip.find(query)
       .populate('agent', 'name email phone branch _id')
       .populate('agentId', 'name email phone branch _id')
       .sort({ createdAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .skip((page - 1) * limit)
+      .lean(); // Use lean() to get plain objects with all fields
 
     const total = await Trip.countDocuments(query);
 
     // Transform trips to match frontend expectations
-    const transformedTrips = trips.map(trip => ({
-      ...trip.toObject(),
-      id: trip._id,
-      agentId: trip.agent?._id || trip.agentId?._id || trip.agentId,
-      agent: trip.agent?.name || trip.agentId?.name || trip.agent,
-      // Ensure agent object is available for frontend
-      agentDetails: trip.agent || trip.agentId,
-    }));
+    const transformedTrips = trips.map(trip => {
+      // Since we used lean(), trip is already a plain object
+      return {
+        ...trip,
+        id: trip._id,
+        agentId: trip.agent?._id || trip.agentId?._id || trip.agentId,
+        agent: trip.agent?.name || trip.agentId?.name || trip.agent,
+        // Ensure agent object is available for frontend
+        agentDetails: trip.agent || trip.agentId,
+        // Explicitly include driverPhoneNumber
+        driverPhoneNumber: trip.driverPhoneNumber || null,
+      };
+    });
 
     // Return array format for frontend compatibility
     res.json(transformedTrips);
@@ -93,7 +117,8 @@ const getTrip = async (req, res) => {
       .populate('agent', 'name email phone branch _id')
       .populate('agentId', 'name email phone branch _id')
       .populate('onTripPayments.addedBy', 'name role _id')
-      .populate('attachments.uploadedBy', 'name role _id');
+      .populate('attachments.uploadedBy', 'name role _id')
+      .lean(); // Use lean() to get plain object with all fields
 
     if (!trip) {
       return res.status(404).json({ message: 'Trip not found' });
@@ -101,11 +126,14 @@ const getTrip = async (req, res) => {
 
     // No access check - public access
     // Transform to match frontend expectations
+    // Since we used lean(), trip is already a plain object
     const transformedTrip = {
-      ...trip.toObject(),
+      ...trip,
       id: trip._id,
       agentId: trip.agent?._id || trip.agentId?._id || trip.agentId,
       agent: trip.agent?.name || trip.agentId?.name || trip.agent,
+      // Explicitly include driverPhoneNumber
+      driverPhoneNumber: trip.driverPhoneNumber || null,
     };
 
     res.json(transformedTrip);
@@ -135,10 +163,39 @@ const createTrip = async (req, res) => {
       advancePaid,
       agentId, // Frontend se agentId aayega
       branchId, // Frontend se branchId aayega (optional)
+      driverPhoneNumber, // Driver phone number (mandatory)
     } = req.body;
 
     if (!agentId) {
       return res.status(400).json({ message: 'agentId is required' });
+    }
+
+    // Validate driver phone number
+    if (!driverPhoneNumber || !driverPhoneNumber.trim()) {
+      return res.status(400).json({ message: 'Driver phone number is required' });
+    }
+    
+    const trimmedDriverPhone = driverPhoneNumber.trim();
+    console.log('Creating trip with driverPhoneNumber:', trimmedDriverPhone); // Debug log
+
+    // Check for duplicate LR number - Case insensitive and check both lrNumber and tripId
+    if (lrNumber) {
+      const trimmedLrNumber = lrNumber.trim();
+      // Case-insensitive search for duplicate LR number
+      const existingTripByLR = await Trip.findOne({ 
+        $or: [
+          { lrNumber: { $regex: new RegExp(`^${trimmedLrNumber}$`, 'i') } },
+          { tripId: { $regex: new RegExp(`^${trimmedLrNumber}$`, 'i') } }
+        ]
+      });
+      
+      if (existingTripByLR) {
+        return res.status(400).json({ 
+          message: `LR Number "${lrNumber}" already exists in the system. Please search for this LR number using the search function or use a different LR number.`,
+          duplicateLrNumber: lrNumber,
+          existingTripId: existingTripByLR._id
+        });
+      }
     }
 
     // Get agent to get branch if branchId not provided
@@ -176,7 +233,10 @@ const createTrip = async (req, res) => {
       agent: agentId,
       agentId: agentId,
       branch: branchId || agent.branch || null,
+      driverPhoneNumber: trimmedDriverPhone,
     });
+    
+    console.log('Trip created successfully with driverPhoneNumber:', trip.driverPhoneNumber); // Debug log
 
     // Create ledger entry - Only debit the advance amount paid by agent, NOT the freight
     // Freight is informational, not a wallet transaction
@@ -217,25 +277,37 @@ const createTrip = async (req, res) => {
     try {
       populatedTrip = await Trip.findById(trip._id)
         .populate('agent', 'name email phone branch _id')
-        .populate('agentId', 'name email phone branch _id');
+        .populate('agentId', 'name email phone branch _id')
+        .lean(); // Use lean() to get plain object with all fields including driverPhoneNumber
     } catch (populateError) {
       console.error('Populate error (non-critical):', populateError);
       // If populate fails, use trip without populate
-      populatedTrip = trip;
+      populatedTrip = trip.toObject ? trip.toObject() : trip;
     }
 
     // Transform trip with error handling
     let transformedTrip;
     try {
-      transformedTrip = transformTrip(populatedTrip);
+      // Since we used lean(), populatedTrip is already a plain object
+      const tripObj = populatedTrip;
+      transformedTrip = {
+        ...tripObj,
+        id: tripObj._id || trip._id,
+        agentId: tripObj.agent?._id || tripObj.agentId?._id || tripObj.agentId || agentId,
+        agent: tripObj.agent?.name || tripObj.agentId?.name || tripObj.agent || agent?.name || 'Unknown',
+        // Explicitly include driverPhoneNumber - this is critical!
+        driverPhoneNumber: tripObj.driverPhoneNumber || trip.driverPhoneNumber || trimmedDriverPhone || null,
+      };
+      console.log('Transformed trip driverPhoneNumber:', transformedTrip.driverPhoneNumber); // Debug log
     } catch (transformError) {
       console.error('Transform error (non-critical):', transformError);
-      // If transform fails, send basic trip data
+      // If transform fails, send basic trip data with driverPhoneNumber
       transformedTrip = {
         ...(populatedTrip.toObject ? populatedTrip.toObject() : populatedTrip),
         id: trip._id,
         agentId: agentId,
         agent: agent?.name || 'Unknown',
+        driverPhoneNumber: trip.driverPhoneNumber || trimmedDriverPhone || null,
       };
     }
 
@@ -685,6 +757,16 @@ const updateDeductions = async (req, res) => {
     }, 0);
 
     trip.deductions = { ...trip.deductions, ...req.body };
+    
+    // Debug: Log deductions to verify addedBy is saved
+    console.log('Saving deductions for LR:', trip.lrNumber, {
+      addedBy: trip.deductions.addedBy,
+      addedByRole: trip.deductions.addedByRole,
+      totalDeductions: Object.entries(trip.deductions).reduce((sum, [key, val]) => {
+        if (key === 'othersReason' || key === 'addedBy' || key === 'addedByRole') return sum;
+        return sum + (parseFloat(val) || 0);
+      }, 0)
+    });
 
     // Recalculate balance
     const totalDeductions = Object.entries(trip.deductions).reduce((sum, [key, val]) => {
@@ -708,12 +790,15 @@ const updateDeductions = async (req, res) => {
     if (totalDeductions > 0 && deductionsAddedBy) {
       try {
         // Check if there's already a Settlement entry for this trip and agent (to avoid duplicates)
+        // Use multiple matching criteria to ensure we find the correct entry
         const existingEntry = await Ledger.findOne({
-          tripId: trip._id,
+          $or: [
+            { tripId: trip._id },
+            { lrNumber: trip.lrNumber }
+          ],
           agent: deductionsAddedBy,
+          agentId: deductionsAddedBy,
           type: 'Settlement',
-          // Only check entries created before trip closure (not the ones created during closeTrip)
-          // We can identify them by checking if trip is still Active
         });
 
         // Always create/update entry when deductions are saved (for Active trips)
@@ -724,6 +809,7 @@ const updateDeductions = async (req, res) => {
 
           // If entry exists, update it; otherwise create new
           if (existingEntry) {
+            console.log(`Found existing Settlement entry for LR ${trip.lrNumber}, Agent ${deductionsAddedBy}. Updating instead of creating duplicate.`);
             // Store old amount to adjust balance calculation
             const oldAmount = existingEntry.amount || 0;
             
@@ -750,35 +836,72 @@ const updateDeductions = async (req, res) => {
             
             console.log(`Ledger entry updated for Closing Deductions: LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance}`);
           } else {
-            // Get agent's current balance BEFORE creating entry
-            const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
-            const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
-              if (entry.direction === 'Credit') {
-                return sum + (entry.amount || 0);
-              } else {
-                return sum - (entry.amount || 0);
-              }
-            }, 0);
-
-            // Create new entry
-            await Ledger.create({
-              tripId: trip._id,
-              lrNumber: trip.lrNumber,
-              date: new Date(),
-              description: `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${trip.deductions.cess || 0}, Kata: ${trip.deductions.kata || 0}, Expenses: ${trip.deductions.expenses || 0}, Others: ${trip.deductions.others || 0})`,
-              type: 'Settlement',
-              amount: totalDeductions,
-              advance: 0,
-              balance: deductionsAgentBalance - totalDeductions, // Balance after deducting this amount
+            // Double-check: Make sure no duplicate entry exists (extra safety check)
+            // This prevents race conditions where multiple requests might create duplicates
+            const duplicateCheck = await Ledger.findOne({
+              $or: [
+                { tripId: trip._id },
+                { lrNumber: trip.lrNumber }
+              ],
               agent: deductionsAddedBy,
               agentId: deductionsAddedBy,
-              bank: 'HDFC Bank',
-              direction: 'Debit',
-              paymentMadeBy: deductionsAddedByRole,
-              deductionsAddedBy: deductionsAddedBy,
-              // NOT informational - balance WILL be affected
+              type: 'Settlement',
             });
-            console.log(`Ledger entry created for Closing Deductions (on save): LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance - totalDeductions}`);
+
+            if (duplicateCheck) {
+              // Entry found in duplicate check - update it instead of creating new
+              console.log(`Duplicate check found existing entry for LR ${trip.lrNumber}, Agent ${deductionsAddedBy}. Updating instead of creating duplicate.`);
+              duplicateCheck.amount = totalDeductions;
+              duplicateCheck.description = `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${trip.deductions.cess || 0}, Kata: ${trip.deductions.kata || 0}, Expenses: ${trip.deductions.expenses || 0}, Others: ${trip.deductions.others || 0})`;
+              duplicateCheck.deductionsAddedBy = deductionsAddedBy;
+              duplicateCheck.paymentMadeBy = deductionsAddedByRole;
+              await duplicateCheck.save();
+              
+              // Recalculate balance AFTER updating entry
+              const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
+              const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
+                if (entry.direction === 'Credit') {
+                  return sum + (entry.amount || 0);
+                } else {
+                  return sum - (entry.amount || 0);
+                }
+              }, 0);
+              
+              duplicateCheck.balance = deductionsAgentBalance;
+              await duplicateCheck.save();
+              console.log(`Ledger entry updated (duplicate check): LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance}`);
+            } else {
+              // No existing entry found - safe to create new
+              // Get agent's current balance BEFORE creating entry
+              const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
+              const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
+                if (entry.direction === 'Credit') {
+                  return sum + (entry.amount || 0);
+                } else {
+                  return sum - (entry.amount || 0);
+                }
+              }, 0);
+
+              // Create new entry
+              await Ledger.create({
+                tripId: trip._id,
+                lrNumber: trip.lrNumber,
+                date: new Date(),
+                description: `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${trip.deductions.cess || 0}, Kata: ${trip.deductions.kata || 0}, Expenses: ${trip.deductions.expenses || 0}, Others: ${trip.deductions.others || 0})`,
+                type: 'Settlement',
+                amount: totalDeductions,
+                advance: 0,
+                balance: deductionsAgentBalance - totalDeductions, // Balance after deducting this amount
+                agent: deductionsAddedBy,
+                agentId: deductionsAddedBy,
+                bank: 'HDFC Bank',
+                direction: 'Debit',
+                paymentMadeBy: deductionsAddedByRole,
+                deductionsAddedBy: deductionsAddedBy,
+                // NOT informational - balance WILL be affected
+              });
+              console.log(`Ledger entry created for Closing Deductions (on save): LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance - totalDeductions}`);
+            }
           }
         }
       } catch (ledgerError) {
@@ -867,12 +990,6 @@ const closeTrip = async (req, res) => {
 
     const { forceClose, closedBy, closedByRole } = req.body;
     const tripCreatorId = trip.agent || trip.agentId;
-
-    // Validation: Trip creator cannot close trip (only for Agents)
-    if (closedByRole === 'Agent' && closedBy && tripCreatorId && 
-        String(closedBy).trim() === String(tripCreatorId).trim()) {
-      return res.status(400).json({ message: 'Trip creator cannot close the trip. Another agent must close it.' });
-    }
 
     // Check if trip has open dispute
     const openDispute = await Dispute.findOne({ 

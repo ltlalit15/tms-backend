@@ -57,6 +57,10 @@ const tripSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  driverPhoneNumber: {
+    type: String,
+    required: true,
+  },
   companyName: {
     type: String,
     required: true,
