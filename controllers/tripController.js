@@ -2,6 +2,7 @@ const Trip = require('../models/Trip');
 const Ledger = require('../models/Ledger');
 const Dispute = require('../models/Dispute');
 const User = require('../models/User');
+const Company = require('../models/Company');
 const { createAuditLog } = require('../middleware/auditLog');
 
 // Helper function to transform trip for frontend
@@ -34,6 +35,49 @@ const transformTrip = (trip) => {
     // Explicitly include driverPhoneNumber - ensure it's always included
     driverPhoneNumber: driverPhone,
   };
+};
+
+// @desc    Get distinct company names for dropdowns
+// @route   GET /api/trips/companies
+// @access  Public
+const getCompanyNames = async (req, res) => {
+  try {
+    const { search } = req.query || {};
+    const filter = {};
+
+    // Optional fuzzy search filter
+    if (search && search.trim()) {
+      filter.companyName = { $regex: search.trim(), $options: 'i' };
+    }
+
+    // Pull saved companies from admin list
+    const savedCompanies = await Company.find(
+      search && search.trim() ? { name: { $regex: search.trim(), $options: 'i' } } : {}
+    )
+      .collation({ locale: 'en', strength: 2 })
+      .sort({ name: 1 })
+      .select('name')
+      .lean();
+
+    // Also include historic names from trips as fallback
+    const tripCompanies = await Trip.distinct('companyName', filter);
+
+    const merged = [
+      ...savedCompanies.map(c => c.name),
+      ...tripCompanies,
+    ];
+
+    const cleaned = Array.from(new Set(merged))
+      .filter(Boolean)
+      .map(name => name.trim())
+      .filter(name => name.length > 0)
+      .sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+
+    res.json(cleaned);
+  } catch (error) {
+    console.error('Get company names error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
 };
 
 // @desc    Get all trips
@@ -537,14 +581,20 @@ const addPayment = async (req, res) => {
 
     trip.onTripPayments.push(payment);
 
-    // Recalculate balance
+    // Recalculate balance with new logic:
+    // Cess, Kata, Excess Tonnage, Halting, Expenses, Others are ADDED to initial balance
+    // Beta is SUBTRACTED from final balance
     const totalPayments = trip.onTripPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
-    const totalDeductions = trip.deductions ? Object.entries(trip.deductions).reduce((sum, [key, val]) => {
-      if (key === 'othersReason') return sum;
-      return sum + (parseFloat(val) || 0);
-    }, 0) : 0;
+    const deductions = trip.deductions || {};
+    const totalAdditions = (parseFloat(deductions.cess) || 0) + 
+                          (parseFloat(deductions.kata) || 0) + 
+                          (parseFloat(deductions.excessTonnage) || 0) + 
+                          (parseFloat(deductions.halting) || 0) + 
+                          (parseFloat(deductions.expenses) || 0) + 
+                          (parseFloat(deductions.others) || 0);
+    const betaAmount = parseFloat(deductions.beta) || 0;
     const initialBalance = trip.freight - trip.advance;
-    trip.balance = initialBalance - totalDeductions - totalPayments;
+    trip.balance = initialBalance + totalAdditions - betaAmount - totalPayments;
     trip.balanceAmount = trip.balance;
 
     await trip.save();
@@ -758,24 +808,37 @@ const updateDeductions = async (req, res) => {
 
     trip.deductions = { ...trip.deductions, ...req.body };
     
+    // Calculate new totals for logging
+    const newTotalAdditions = (parseFloat(trip.deductions.cess) || 0) + 
+                              (parseFloat(trip.deductions.kata) || 0) + 
+                              (parseFloat(trip.deductions.excessTonnage) || 0) + 
+                              (parseFloat(trip.deductions.halting) || 0) + 
+                              (parseFloat(trip.deductions.expenses) || 0) + 
+                              (parseFloat(trip.deductions.others) || 0);
+    const newBetaAmount = parseFloat(trip.deductions.beta) || 0;
+    
     // Debug: Log deductions to verify addedBy is saved
     console.log('Saving deductions for LR:', trip.lrNumber, {
       addedBy: trip.deductions.addedBy,
       addedByRole: trip.deductions.addedByRole,
-      totalDeductions: Object.entries(trip.deductions).reduce((sum, [key, val]) => {
-        if (key === 'othersReason' || key === 'addedBy' || key === 'addedByRole') return sum;
-        return sum + (parseFloat(val) || 0);
-      }, 0)
+      totalAdditions: newTotalAdditions,
+      betaAmount: newBetaAmount
     });
 
-    // Recalculate balance
-    const totalDeductions = Object.entries(trip.deductions).reduce((sum, [key, val]) => {
-      if (key === 'othersReason' || key === 'addedBy' || key === 'addedByRole') return sum;
-      return sum + (parseFloat(val) || 0);
-    }, 0);
+    // Recalculate balance with new logic:
+    // Cess, Kata, Excess Tonnage, Halting, Expenses, Others are ADDED to initial balance
+    // Beta is SUBTRACTED from final balance
+    const deductions = trip.deductions || {};
+    const totalAdditions = (parseFloat(deductions.cess) || 0) + 
+                          (parseFloat(deductions.kata) || 0) + 
+                          (parseFloat(deductions.excessTonnage) || 0) + 
+                          (parseFloat(deductions.halting) || 0) + 
+                          (parseFloat(deductions.expenses) || 0) + 
+                          (parseFloat(deductions.others) || 0);
+    const betaAmount = parseFloat(deductions.beta) || 0;
     const totalPayments = trip.onTripPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
     const initialBalance = trip.freight - trip.advance;
-    trip.balance = initialBalance - totalDeductions - totalPayments;
+    trip.balance = initialBalance + totalAdditions - betaAmount - totalPayments;
     trip.balanceAmount = trip.balance;
 
     await trip.save();
@@ -787,121 +850,115 @@ const updateDeductions = async (req, res) => {
     
     // Always create/update ledger entry when deductions are saved (even if updating existing deductions)
     // This ensures the agent who saved deductions gets the entry in their ledger
-    if (totalDeductions > 0 && deductionsAddedBy) {
+    // New logic: Create separate entries for additions (Credit) and Beta (Debit)
+    if ((totalAdditions > 0 || betaAmount > 0) && deductionsAddedBy && trip.status === 'Active') {
       try {
-        // Check if there's already a Settlement entry for this trip and agent (to avoid duplicates)
-        // Use multiple matching criteria to ensure we find the correct entry
-        const existingEntry = await Ledger.findOne({
-          $or: [
-            { tripId: trip._id },
-            { lrNumber: trip.lrNumber }
-          ],
-          agent: deductionsAddedBy,
-          agentId: deductionsAddedBy,
-          type: 'Settlement',
-        });
+        // Get agent name who added deductions
+        const deductionsAddedByUser = await User.findById(deductionsAddedBy);
+        const deductionsAddedByName = deductionsAddedByUser?.name || 'Unknown Agent';
 
-        // Always create/update entry when deductions are saved (for Active trips)
-        if (trip.status === 'Active') {
-          // Get agent name who added deductions
-          const deductionsAddedByUser = await User.findById(deductionsAddedBy);
-          const deductionsAddedByName = deductionsAddedByUser?.name || 'Unknown Agent';
+        // Helper function to get agent balance
+        const getAgentBalance = async (agentId) => {
+          const agentLedger = await Ledger.find({ agent: agentId });
+          return agentLedger.reduce((sum, entry) => {
+            if (entry.direction === 'Credit') {
+              return sum + (entry.amount || 0);
+            } else {
+              return sum - (entry.amount || 0);
+            }
+          }, 0);
+        };
 
-          // If entry exists, update it; otherwise create new
-          if (existingEntry) {
-            console.log(`Found existing Settlement entry for LR ${trip.lrNumber}, Agent ${deductionsAddedBy}. Updating instead of creating duplicate.`);
-            // Store old amount to adjust balance calculation
-            const oldAmount = existingEntry.amount || 0;
-            
-            // Update existing entry with new total deductions
-            existingEntry.amount = totalDeductions;
-            existingEntry.description = `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${trip.deductions.cess || 0}, Kata: ${trip.deductions.kata || 0}, Expenses: ${trip.deductions.expenses || 0}, Others: ${trip.deductions.others || 0})`;
-            existingEntry.deductionsAddedBy = deductionsAddedBy;
-            existingEntry.paymentMadeBy = deductionsAddedByRole;
-            await existingEntry.save();
-            
-            // Recalculate balance AFTER updating entry
-            const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
-            const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
-              if (entry.direction === 'Credit') {
-                return sum + (entry.amount || 0);
-              } else {
-                return sum - (entry.amount || 0);
-              }
-            }, 0);
-            
-            // Update balance field
-            existingEntry.balance = deductionsAgentBalance;
-            await existingEntry.save();
-            
-            console.log(`Ledger entry updated for Closing Deductions: LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance}`);
+        // Create/update Credit entry for additions (Cess, Kata, Excess Tonnage, Halting, Expenses, Others)
+        if (totalAdditions > 0) {
+          const existingCreditEntry = await Ledger.findOne({
+            $or: [
+              { tripId: trip._id },
+              { lrNumber: trip.lrNumber }
+            ],
+            agent: deductionsAddedBy,
+            agentId: deductionsAddedBy,
+            type: 'Settlement',
+            direction: 'Credit',
+          });
+
+          const agentBalance = await getAgentBalance(deductionsAddedBy);
+
+          if (existingCreditEntry) {
+            existingCreditEntry.amount = totalAdditions;
+            existingCreditEntry.description = `Closing additions for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${deductions.cess || 0}, Kata: ${deductions.kata || 0}, Excess Tonnage: ${deductions.excessTonnage || 0}, Halting: ${deductions.halting || 0}, Expenses: ${deductions.expenses || 0}, Others: ${deductions.others || 0})`;
+            existingCreditEntry.deductionsAddedBy = deductionsAddedBy;
+            existingCreditEntry.paymentMadeBy = deductionsAddedByRole;
+            await existingCreditEntry.save();
+            const newBalance = await getAgentBalance(deductionsAddedBy);
+            existingCreditEntry.balance = newBalance;
+            await existingCreditEntry.save();
+            console.log(`Credit entry updated for Closing Additions: LR ${trip.lrNumber}, Amount ${totalAdditions}`);
           } else {
-            // Double-check: Make sure no duplicate entry exists (extra safety check)
-            // This prevents race conditions where multiple requests might create duplicates
-            const duplicateCheck = await Ledger.findOne({
-              $or: [
-                { tripId: trip._id },
-                { lrNumber: trip.lrNumber }
-              ],
+            await Ledger.create({
+              tripId: trip._id,
+              lrNumber: trip.lrNumber,
+              date: new Date(),
+              description: `Closing additions for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${deductions.cess || 0}, Kata: ${deductions.kata || 0}, Excess Tonnage: ${deductions.excessTonnage || 0}, Halting: ${deductions.halting || 0}, Expenses: ${deductions.expenses || 0}, Others: ${deductions.others || 0})`,
+              type: 'Settlement',
+              amount: totalAdditions,
+              advance: 0,
+              balance: agentBalance + totalAdditions,
               agent: deductionsAddedBy,
               agentId: deductionsAddedBy,
-              type: 'Settlement',
+              bank: 'HDFC Bank',
+              direction: 'Credit',
+              paymentMadeBy: deductionsAddedByRole,
+              deductionsAddedBy: deductionsAddedBy,
             });
+            console.log(`Credit entry created for Closing Additions: LR ${trip.lrNumber}, Amount ${totalAdditions}`);
+          }
+        }
 
-            if (duplicateCheck) {
-              // Entry found in duplicate check - update it instead of creating new
-              console.log(`Duplicate check found existing entry for LR ${trip.lrNumber}, Agent ${deductionsAddedBy}. Updating instead of creating duplicate.`);
-              duplicateCheck.amount = totalDeductions;
-              duplicateCheck.description = `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${trip.deductions.cess || 0}, Kata: ${trip.deductions.kata || 0}, Expenses: ${trip.deductions.expenses || 0}, Others: ${trip.deductions.others || 0})`;
-              duplicateCheck.deductionsAddedBy = deductionsAddedBy;
-              duplicateCheck.paymentMadeBy = deductionsAddedByRole;
-              await duplicateCheck.save();
-              
-              // Recalculate balance AFTER updating entry
-              const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
-              const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
-                if (entry.direction === 'Credit') {
-                  return sum + (entry.amount || 0);
-                } else {
-                  return sum - (entry.amount || 0);
-                }
-              }, 0);
-              
-              duplicateCheck.balance = deductionsAgentBalance;
-              await duplicateCheck.save();
-              console.log(`Ledger entry updated (duplicate check): LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance}`);
-            } else {
-              // No existing entry found - safe to create new
-              // Get agent's current balance BEFORE creating entry
-              const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
-              const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
-                if (entry.direction === 'Credit') {
-                  return sum + (entry.amount || 0);
-                } else {
-                  return sum - (entry.amount || 0);
-                }
-              }, 0);
+        // Create/update Debit entry for Beta
+        if (betaAmount > 0) {
+          const existingDebitEntry = await Ledger.findOne({
+            $or: [
+              { tripId: trip._id },
+              { lrNumber: trip.lrNumber }
+            ],
+            agent: deductionsAddedBy,
+            agentId: deductionsAddedBy,
+            type: 'Settlement',
+            direction: 'Debit',
+            description: { $regex: /Beta|Batta/i },
+          });
 
-              // Create new entry
-              await Ledger.create({
-                tripId: trip._id,
-                lrNumber: trip.lrNumber,
-                date: new Date(),
-                description: `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${trip.deductions.cess || 0}, Kata: ${trip.deductions.kata || 0}, Expenses: ${trip.deductions.expenses || 0}, Others: ${trip.deductions.others || 0})`,
-                type: 'Settlement',
-                amount: totalDeductions,
-                advance: 0,
-                balance: deductionsAgentBalance - totalDeductions, // Balance after deducting this amount
-                agent: deductionsAddedBy,
-                agentId: deductionsAddedBy,
-                bank: 'HDFC Bank',
-                direction: 'Debit',
-                paymentMadeBy: deductionsAddedByRole,
-                deductionsAddedBy: deductionsAddedBy,
-                // NOT informational - balance WILL be affected
-              });
-              console.log(`Ledger entry created for Closing Deductions (on save): LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance - totalDeductions}`);
-            }
+          const agentBalance = await getAgentBalance(deductionsAddedBy);
+
+          if (existingDebitEntry) {
+            existingDebitEntry.amount = betaAmount;
+            existingDebitEntry.description = `Beta/Batta deduction for ${trip.lrNumber} by ${deductionsAddedByName} (Beta: ${betaAmount})`;
+            existingDebitEntry.deductionsAddedBy = deductionsAddedBy;
+            existingDebitEntry.paymentMadeBy = deductionsAddedByRole;
+            await existingDebitEntry.save();
+            const newBalance = await getAgentBalance(deductionsAddedBy);
+            existingDebitEntry.balance = newBalance;
+            await existingDebitEntry.save();
+            console.log(`Debit entry updated for Beta: LR ${trip.lrNumber}, Amount ${betaAmount}`);
+          } else {
+            await Ledger.create({
+              tripId: trip._id,
+              lrNumber: trip.lrNumber,
+              date: new Date(),
+              description: `Beta/Batta deduction for ${trip.lrNumber} by ${deductionsAddedByName} (Beta: ${betaAmount})`,
+              type: 'Settlement',
+              amount: betaAmount,
+              advance: 0,
+              balance: agentBalance - betaAmount,
+              agent: deductionsAddedBy,
+              agentId: deductionsAddedBy,
+              bank: 'HDFC Bank',
+              direction: 'Debit',
+              paymentMadeBy: deductionsAddedByRole,
+              deductionsAddedBy: deductionsAddedBy,
+            });
+            console.log(`Debit entry created for Beta: LR ${trip.lrNumber}, Amount ${betaAmount}`);
           }
         }
       } catch (ledgerError) {
@@ -1037,15 +1094,19 @@ const closeTrip = async (req, res) => {
       return res.json(transformedTrip);
     }
 
-    // For Regular trips - calculate final balance
+    // For Regular trips - calculate final balance with new logic:
+    // Cess, Kata, Excess Tonnage, Halting, Expenses, Others are ADDED to initial balance
+    // Beta is SUBTRACTED from final balance
     const deductions = trip.deductions || {};
     const betaAmount = parseFloat(deductions.beta) || 0;
 
-    // Calculate total deductions excluding Beta/Batta
-    const totalDeductions = Object.entries(deductions).reduce((sum, [key, val]) => {
-      if (key === 'othersReason' || key === 'beta') return sum;
-      return sum + (parseFloat(val) || 0);
-    }, 0);
+    // Calculate total additions (Cess, Kata, Excess Tonnage, Halting, Expenses, Others)
+    const totalAdditions = (parseFloat(deductions.cess) || 0) + 
+                          (parseFloat(deductions.kata) || 0) + 
+                          (parseFloat(deductions.excessTonnage) || 0) + 
+                          (parseFloat(deductions.halting) || 0) + 
+                          (parseFloat(deductions.expenses) || 0) + 
+                          (parseFloat(deductions.others) || 0);
 
     // Separate Finance payments from Agent payments
     // Finance payments are already credited to agent wallet, so don't deduct from finalBalance
@@ -1060,11 +1121,11 @@ const closeTrip = async (req, res) => {
     const totalPayments = trip.onTripPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
     const initialBalance = trip.freight - trip.advance;
     
-    // Final balance calculation:
-    // initialBalance - deductions - agentPayments
+    // Final balance calculation with new logic:
+    // Initial Balance + (Cess + Kata + Excess Tonnage + Halting + Expenses + Others) - Beta - Agent Payments + Finance Payments
     // Finance payments are NOT deducted because they're already credited to agent wallet
     // Finance payments should INCREASE the final settlement amount
-    const finalBalance = initialBalance - totalDeductions - agentPayments + financePayments;
+    const finalBalance = initialBalance + totalAdditions - betaAmount - agentPayments + financePayments;
 
     // Validation: Agent can only close when finalBalance === 0
     // If finalBalance > 0, closing agent must have enough balance to pay
@@ -1105,104 +1166,88 @@ const closeTrip = async (req, res) => {
     // Create ledger entries for closing deductions (if any deductions were added)
     // Note: Entry for agent who added deductions is already created in updateDeductions
     // Here we only create entry for trip creator (if different from agent who added deductions)
-    if (totalDeductions > 0) {
+    // New logic: Entries are already created in updateDeductions with separate Credit (additions) and Debit (beta) entries
+    // So we just need to verify/update balances here if needed
+    if ((totalAdditions > 0 || betaAmount > 0) && String(tripCreatorId).trim() !== String(deductionsAddedBy).trim()) {
       try {
         // Get agent name who added deductions for description
         const deductionsAddedByUser = await User.findById(deductionsAddedBy);
         const deductionsAddedByName = deductionsAddedByUser?.name || 'Unknown Agent';
 
-        // Entry 1: Trip creator's account - Debit (actual deduction)
-        // Only create if trip creator is different from agent who added deductions
-        // (If same, the entry was already created in updateDeductions)
-        if (String(tripCreatorId).trim() !== String(deductionsAddedBy).trim()) {
-          // Check if entry already exists for trip creator
-          const existingTripCreatorEntry = await Ledger.findOne({
+        // Create entries for trip creator (if different from agent who added deductions)
+        // New logic: Create separate Credit (additions) and Debit (beta) entries
+        // Helper function to get agent balance
+        const getAgentBalance = async (agentId) => {
+          const agentLedger = await Ledger.find({ agent: agentId });
+          return agentLedger.reduce((sum, entry) => {
+            if (entry.direction === 'Credit') {
+              return sum + (entry.amount || 0);
+            } else {
+              return sum - (entry.amount || 0);
+            }
+          }, 0);
+        };
+
+        // Create Credit entry for additions (if any)
+        if (totalAdditions > 0) {
+          const existingCreditEntry = await Ledger.findOne({
             tripId: trip._id,
             agent: tripCreatorId,
             type: 'Settlement',
+            direction: 'Credit',
           });
 
-          if (!existingTripCreatorEntry) {
-            const tripCreatorLedger = await Ledger.find({ agent: tripCreatorId });
-            const tripCreatorBalance = tripCreatorLedger.reduce((sum, entry) => {
-              if (entry.direction === 'Credit') {
-                return sum + (entry.amount || 0);
-              } else {
-                return sum - (entry.amount || 0);
-              }
-            }, 0);
-
+          if (!existingCreditEntry) {
+            const tripCreatorBalance = await getAgentBalance(tripCreatorId);
             await Ledger.create({
               tripId: trip._id,
               lrNumber: trip.lrNumber,
               date: new Date(),
-              description: `Closing deductions added by ${deductionsAddedByName} for ${trip.lrNumber} (Cess: ${deductions.cess || 0}, Kata: ${deductions.kata || 0}, Expenses: ${deductions.expenses || 0}, Others: ${deductions.others || 0})`,
+              description: `Closing additions for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${deductions.cess || 0}, Kata: ${deductions.kata || 0}, Excess Tonnage: ${deductions.excessTonnage || 0}, Halting: ${deductions.halting || 0}, Expenses: ${deductions.expenses || 0}, Others: ${deductions.others || 0})`,
               type: 'Settlement',
-              amount: totalDeductions,
+              amount: totalAdditions,
               advance: 0,
-              balance: tripCreatorBalance - totalDeductions,
-              agent: tripCreatorId, // Debit trip creator's account
+              balance: tripCreatorBalance + totalAdditions,
+              agent: tripCreatorId,
               agentId: tripCreatorId,
               bank: 'HDFC Bank',
-              direction: 'Debit',
-              paymentMadeBy: deductionsAddedByRole, // Track who added deductions (for display in Finance ledger)
-              deductionsAddedBy: deductionsAddedBy, // Store who added deductions
+              direction: 'Credit',
+              paymentMadeBy: deductionsAddedByRole,
+              deductionsAddedBy: deductionsAddedBy,
             });
-            console.log(`Ledger entry created for Closing Deductions (Trip Creator): LR ${trip.lrNumber}, Amount ${totalDeductions}, Trip Creator ${tripCreatorId}`);
+            console.log(`Credit entry created for Trip Creator: LR ${trip.lrNumber}, Amount ${totalAdditions}`);
           }
         }
 
-        // Entry 2: Agent who added deductions - Entry already created in updateDeductions
-        // Just verify it exists and update balance if needed
-        if (deductionsAddedBy) {
-          const existingDeductionsEntry = await Ledger.findOne({
+        // Create Debit entry for Beta (if any)
+        if (betaAmount > 0) {
+          const existingDebitEntry = await Ledger.findOne({
             tripId: trip._id,
-            agent: deductionsAddedBy,
+            agent: tripCreatorId,
             type: 'Settlement',
+            direction: 'Debit',
+            description: { $regex: /Beta|Batta/i },
           });
 
-          if (existingDeductionsEntry) {
-            // Entry already exists (created in updateDeductions), just update balance
-            const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
-            const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
-              if (entry.direction === 'Credit') {
-                return sum + (entry.amount || 0);
-              } else {
-                return sum - (entry.amount || 0);
-              }
-            }, 0);
-            
-            existingDeductionsEntry.balance = deductionsAgentBalance;
-            await existingDeductionsEntry.save();
-            console.log(`Ledger entry balance updated for Closing Deductions (Added By Agent): LR ${trip.lrNumber}, Agent ${deductionsAddedBy}, Balance: ${deductionsAgentBalance}`);
-          } else {
-            // Entry doesn't exist (shouldn't happen, but create it as fallback)
-            const deductionsAgentLedger = await Ledger.find({ agent: deductionsAddedBy });
-            const deductionsAgentBalance = deductionsAgentLedger.reduce((sum, entry) => {
-              if (entry.direction === 'Credit') {
-                return sum + (entry.amount || 0);
-              } else {
-                return sum - (entry.amount || 0);
-              }
-            }, 0);
-
+          if (!existingDebitEntry) {
+            const tripCreatorBalance = await getAgentBalance(tripCreatorId);
             await Ledger.create({
               tripId: trip._id,
               lrNumber: trip.lrNumber,
               date: new Date(),
-              description: `Closing deductions added for ${trip.lrNumber} by ${deductionsAddedByName} (Cess: ${deductions.cess || 0}, Kata: ${deductions.kata || 0}, Expenses: ${deductions.expenses || 0}, Others: ${deductions.others || 0})`,
+              description: `Beta/Batta deduction for ${trip.lrNumber} by ${deductionsAddedByName} (Beta: ${betaAmount})`,
               type: 'Settlement',
-              amount: totalDeductions,
+              amount: betaAmount,
               advance: 0,
-              balance: deductionsAgentBalance - totalDeductions,
-              agent: deductionsAddedBy,
-              agentId: deductionsAddedBy,
+              balance: tripCreatorBalance - betaAmount,
+              agent: tripCreatorId,
+              agentId: tripCreatorId,
               bank: 'HDFC Bank',
               direction: 'Debit',
               paymentMadeBy: deductionsAddedByRole,
               deductionsAddedBy: deductionsAddedBy,
             });
-            console.log(`Ledger entry created for Closing Deductions (Added By Agent - Fallback): LR ${trip.lrNumber}, Amount ${totalDeductions}, Added by ${deductionsAddedBy} (${deductionsAddedByName}), Balance: ${deductionsAgentBalance - totalDeductions}`);
+            console.log(`Debit entry created for Trip Creator (Beta): LR ${trip.lrNumber}, Amount ${betaAmount}`);
           }
         }
       } catch (ledgerError) {
@@ -1431,5 +1476,6 @@ module.exports = {
   closeTrip,
   addAttachment,
   deleteAttachment,
+  getCompanyNames,
 };
 

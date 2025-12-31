@@ -24,6 +24,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/users', require('./routes/userRoutes'));
 app.use('/api/branches', require('./routes/branchRoutes'));
+app.use('/api/companies', require('./routes/companyRoutes'));
+console.log('Company routes registered at /api/companies');
 app.use('/api/trips', require('./routes/tripRoutes'));
 app.use('/api/ledger', require('./routes/ledgerRoutes'));
 app.use('/api/disputes', require('./routes/disputeRoutes'));

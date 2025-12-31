@@ -11,6 +11,7 @@ const {
   closeTrip,
   addAttachment,
   deleteAttachment,
+  getCompanyNames,
 } = require('../controllers/tripController');
 const upload = require('../utils/upload');
 
@@ -18,6 +19,8 @@ const upload = require('../utils/upload');
 router.route('/')
   .get(getTrips)
   .post(createTrip);
+
+router.get('/companies', getCompanyNames);
 
 router.route('/:id')
   .get(getTrip)
